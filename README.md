@@ -1,150 +1,88 @@
-# CABIFY CAR POOLING SERVICE
-## Proposed challenge
-https://gitlab.com/cabify-challenge/car-pooling-challenge-aifriend/blob/master/CHALLENGE.md
+# Car Pooling Service
 
-### Stack used
-- Python 3.7
-- FastAPI
+REST API for managing a car pooling service, built as a coding challenge. Handles car fleet management, journey requests, passenger allocation, and drop-off operations.
 
-### IDE
-- PyCharm
-- Gitlab CI
-- Docker
+## Overview
 
-### REST service endpoints
+A microservice that matches groups of people to available cars based on seat availability, implementing a priority queue for waiting passengers.
 
-This service provide a REST API which will be used to interact with it.
+## API Endpoints
 
-This API comply with the following contract:
+| Method | Endpoint | Description | Response |
+|--------|----------|-------------|----------|
+| `GET` | `/status` | Health check | `200 OK` |
+| `PUT` | `/cars` | Load car fleet (JSON) | `200 OK` / `400 Bad Request` |
+| `POST` | `/journey` | Request a ride (JSON) | `200 OK` / `202 Accepted` |
+| `POST` | `/dropoff` | End a journey (form data) | `200 OK` / `404 Not Found` |
+| `POST` | `/locate` | Find assigned car (form data) | `200 JSON` / `204 No Content` |
 
-- GET /status
-    
-    Indicate the service has started up correctly and is ready to accept requests.
-    
-      http://localhost:9091/status
-    
-    Returns: 
-    
-    * **200 OK** When the service is ready to receive requests.
+## Tech Stack
 
-- PUT /cars
+- **Language:** Python 3.7
+- **Framework:** FastAPI
+- **Deployment:** Docker
+- **Port:** 9091
 
-    Load the list of available cars in the service and remove all previous data (existing journeys and cars). This method may be called more than once during the life cycle of the service.
+## Project Structure
 
-      http://localhost:9091/cars
-     
-    **Body** _required_ The list of cars to load.
-    
-    **Content Type** `application/json`
+```
+├── service/
+│   ├── car_pooling/      # Core business logic
+│   ├── test/             # Unit tests
+│   ├── manage.py         # Application entry point
+│   └── requirements.txt
+├── Dockerfile
+├── Makefile
+├── CHALLENGE.md          # Original challenge specification
+└── setup.cfg
+```
 
-    Sample:
-    
-    ```json
-    [
-      {
-        "id": 1,
-        "seats": 4
-      },
-      {
-        "id": 2,
-        "seats": 6
-      }
-    ]
-    ```
+## Getting Started
 
-    Returns:
-    
-    * **200 OK** When the list is registered correctly.
-    * **400 Bad Request** When there is a failure in the request format, expected
-      headers, or the payload can't be unmarshalled.
+### Local Development
+```bash
+cd service
+pip install -r requirements.txt
+python manage.py
+```
 
-- POST /journey
+### Docker
+```bash
+docker build -t car-pooling-service .
+docker run -p 9091:9091 car-pooling-service
+```
 
-    A group of people requests to perform a journey.
-    
-      http://localhost:9091/journey
-         
-    **Body** _required_ The group of people that wants to perform the journey
-    
-    **Content Type** `application/json`
-    
-    Sample:
-    
-    ```json
-    {
-      "id": 1,
-      "people": 4
-    }
-    ```
-    
-    Returns:
-    
-    * **200 OK** or **202 Accepted** When the group is registered correctly
-    * **400 Bad Request** When there is a failure in the request format or the
-      payload can't be unmarshalled.
+### Run Tests
+```bash
+make test
+```
 
-- POST /dropoff
+## Example Usage
 
-    A group of people requests to be dropped off. Whether they traveled or not.
+Load cars:
+```bash
+curl -X PUT http://localhost:9091/cars \
+  -H "Content-Type: application/json" \
+  -d '[{"id": 1, "seats": 4}, {"id": 2, "seats": 6}]'
+```
 
-      http://localhost:9091/dropoff
-      
-    **Body** _required_ A form with the group ID, such that `ID=X`
-    
-    **Content Type** `application/x-www-form-urlencoded`
-    
-    Returns:
-    
-    * **200 OK** or **204 No Content** When the group is unregistered correctly.
-    * **404 Not Found** When the group is not to be found.
-    * **400 Bad Request** When there is a failure in the request format or the
-      payload can't be unmarshalled.
+Request a journey:
+```bash
+curl -X POST http://localhost:9091/journey \
+  -H "Content-Type: application/json" \
+  -d '{"id": 1, "people": 3}'
+```
 
-- POST /locate
+## Design Decisions
 
-    Given a group ID such that `ID=X`, return the car the group is traveling
-    with, or no car if they are still waiting to be served (i.e.- journey requested)
-    
-      http://localhost:9091/locate
-        
-    **Body** _required_ A url encoded form with the group ID such that `ID=X`
-    
-    **Content Type** `application/x-www-form-urlencoded`
-    
-    **Accept** `application/json`
-    
-    Returns:
-    
-    * **200 OK** With the car as the payload when the group is assigned to a car.
-    * **204 No Content** When the group is waiting to be assigned to a car.
-    * **404 Not Found** When the group is not to be found.
-    * **400 Bad Request** When there is a failure in the request format or the
-      payload can't be unmarshalled.
+- Waiting groups are served in FIFO order (priority over new requests)
+- Resetting the car list maintains journey data integrity
+- Continuous matching runs when cars become available after drop-offs
 
-### Architecture
-Just one microservice is implemented that will expose all the car pooling services at 9091 port through above endpoints.
-* Car Pooling Service: This service is responsible for car availability to track the available seats in cars.
+## License
 
-### What was not used (But would be good)
-* Cache: Both client and server side cache can be a good choice in cases of high volume of request in production.
-* Simple car pooling queue handler that should be improved with the use of deep reinforcement learning techniques to improve best action while serving car request in contexts of:
-    - long waiting list
-    - dynamically changing car list of availables car/seats 
-    - frequent drop-offs
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
 
-### Assumptions
-* When a journey request is made, a car is immediately searched for journey allocation. If there is no car availabel, the request kept in the waiting list.
-    * I assume that when a trip is requested, an available car is searched
-    * If no car is found, the travel request is left wait
-* I assume the list of car can be modified at any time maintaining the rest of the data structure of the pooling service as is
-* Those journeys who are waiting they are served first before the new journey request is searched for car allocation
-* The map of journeys/cars is performed each time a journey is requested:
-    * Those who are waiting are served first
-    * Then the current request is served if any
+## Author
 
-## A new approach 
-
-### Reinforcement Learning 
-A crucial point to consider in optimizing a carpooling policy is to gauge the future prospect of being able to pick up additional passengers along the way at each decision point. Reinforcement Learning (RL) is a data-driven approach for solving a Markov decision process (MDP), which models a multi-stage sequential decision-making process with a long optimization horizon.
-
-I develop a reinforcement learning (RL) based system to learn an effective policy for carpooling that maximizes transportation efficiency so that fewer cars are required to fulfill the given amount of trip demand.
+**Jose** — [@aifriend](https://github.com/aifriend)
