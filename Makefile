@@ -3,8 +3,8 @@
 # Copyright Cabify.com
 # Licence MIT
 
-# Variables
-# UNAME		:= $(shell uname -s)
+VENV	:= .venv
+PY	:= $(VENV)/bin/python
 
 .EXPORT_ALL_VARIABLES:
 
@@ -27,6 +27,20 @@ endif
 debug:	### Debug Makefile itself
 	@echo $(UNAME)
 
+.PHONY: setup
+setup:	### Create the virtualenv and install dependencies
+	python3 -m venv $(VENV)
+	$(PY) -m pip install --upgrade pip
+	$(PY) -m pip install -r service/requirements.txt
+
+.PHONY: test
+test:	### Run the test suite
+	cd service && ../$(PY) -m pytest test/ -v
+
+.PHONY: run
+run:	### Run the service locally on port 9091
+	cd service && ../$(PY) manage.py
+
 .PHONY: dockerize
-dockerize: build
+dockerize:	### Build the Docker image
 	@docker build -t car-pooling-challenge:latest .

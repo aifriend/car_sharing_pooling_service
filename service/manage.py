@@ -1,217 +1,124 @@
+"""Car pooling service — REST API entry point.
+
+Run with:  python manage.py   (or: uvicorn manage:app --port 9091)
+
+Optional fairness policies (disabled by default to preserve the challenge
+contract), set via environment variables:
+    QUEUE_TTL_SECONDS       waiting groups give up after this many seconds
+    PRIORITY_AFTER_SECONDS  after a group waits this long, new arrivals
+                            queue behind it (strict FIFO) instead of being
+                            seated directly
+
+Concurrency: all handlers are async and every pool operation runs under a
+single asyncio.Lock, so check-then-act sequences are atomic by design.
+"""
+import asyncio
+import os
+
 import uvicorn
-from car_pooling.CarPooling import CarPooling
-from fastapi import FastAPI, Form
+from fastapi import FastAPI, Form, Response, status
 from fastapi.exceptions import RequestValidationError
-from starlette import status
-from starlette.requests import Request
-from starlette.responses import JSONResponse, Response, PlainTextResponse
+from pydantic import BaseModel, Field
 
-car_pooling = None
+from car_pooling.pool import MAX_SEATS, MIN_SEATS, CarPool, CarPoolError
 
-app = FastAPI()  # API REST Framework
+
+def _env_float(name):
+    value = os.environ.get(name)
+    return float(value) if value else None
+
+
+pool = CarPool(
+    queue_ttl_seconds=_env_float("QUEUE_TTL_SECONDS"),
+    priority_after_seconds=_env_float("PRIORITY_AFTER_SECONDS"),
+)
+pool_lock = asyncio.Lock()
+
+app = FastAPI(title="Car Pooling Service")
+
+
+class CarIn(BaseModel):
+    id: int
+    seats: int = Field(ge=MIN_SEATS, le=MAX_SEATS)
+
+
+class JourneyIn(BaseModel):
+    id: int
+    people: int = Field(ge=MIN_SEATS, le=MAX_SEATS)
 
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request, exc):
-    return PlainTextResponse("", status_code=400)
+    # The contract asks for 400 on malformed payloads, not FastAPI's 422.
+    return Response(status_code=status.HTTP_400_BAD_REQUEST)
 
 
-@app.get("/")
-def service_root_default():
-    return Response(content="Car pooling service",
-                    status_code=status.HTTP_200_OK)
+@app.get("/status")
+async def service_status():
+    """200 OK once the service is ready to receive requests."""
+    return Response(status_code=status.HTTP_200_OK)
 
 
-@app.get("/status", status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
-def service_server_status():
-    """
-    Indicate the service has started up correctly and is ready to accept requests.
-
-    **Method** GET
-    **Url** /status
-
-    Returns:
-    * **200 OK** When the service is ready to receive requests.
-    """
-    try:
-        if car_pooling is not None:
-            return Response(status_code=status.HTTP_200_OK)
-
-    except Exception:
-        return
+@app.get("/metrics")
+async def service_metrics():
+    """Snapshot of fleet utilisation and queue depth (JSON)."""
+    async with pool_lock:
+        pool.expire_waiting()
+        return {
+            "cars_total": pool.cars_total,
+            "seats_total": pool.seats_total,
+            "seats_free": pool.seats_free,
+            "groups_traveling": pool.groups_traveling,
+            "groups_waiting": pool.groups_waiting,
+        }
 
 
 @app.put("/cars")
-async def service_car_load(car_load: list, request: Request):
-    """
-    Load the list of available cars in the service and remove all previous
-    data (existing journeys and cars). This method may be called more than
-    once during the life cycle of the service.
-
-    **Method** PUT
-    **Url** /cars
-    **Body** _required_ The list of cars to load.
-    **Content Type** `application/json`
-    Sample:
-        [
-          {
-            "id": 1,
-            "seats": 4
-          },
-          {
-            "id": 2,
-            "seats": 6
-          }
-        ]
-
-    Returns:
-    * **200 OK** When the list is registered correctly.
-    * **400 Bad Request** When there is a failure in the request format, expected
-    headers, or the payload can't be unmarshalled.
-    """
-    try:
-        if request.headers["content-type"] != 'application/json':  # bad content type
+async def service_load_cars(cars: list[CarIn]):
+    """Load the fleet, removing all previous cars and journeys."""
+    async with pool_lock:
+        try:
+            pool.reset([(car.id, car.seats) for car in cars])
+        except CarPoolError:
             return Response(status_code=status.HTTP_400_BAD_REQUEST)
-
-        if car_load is None:  # null request
-            return Response(status_code=status.HTTP_400_BAD_REQUEST)
-
-        if len(car_load) >= 0:  # at least one car: bad request
-            for car in car_load:
-                if len(car) >= 2:  # at least two items
-                    car_id = car['id']  # must be 'id'
-                    car_seats = car['seats']  # must be 'seats'
-                    if car_pooling.add(int(car_id), int(car_seats)) is None:
-                        return Response(status_code=status.HTTP_400_BAD_REQUEST)
-                else:
-                    return Response(status_code=status.HTTP_400_BAD_REQUEST)
-
-            return Response(status_code=status.HTTP_200_OK)
-
-        else:
-            return Response(status_code=status.HTTP_400_BAD_REQUEST)
-
-    except Exception:
-        return Response(status_code=status.HTTP_400_BAD_REQUEST)
+    return Response(status_code=status.HTTP_200_OK)
 
 
 @app.post("/journey")
-async def service_journey_request(journey_request: dict, request: Request):
-    """
-    A group of people requests to perform a journey.
-
-    **Method** POST
-    **Url** /journey
-    **Body** _required_ The group of people that wants to perform the journey
-    **Content Type** `application/json`
-    Sample:
-    {
-      "id": 1,
-      "people": 4
-    }
-
-    Returns:
-    * **200 OK** or **202 Accepted** When the group is registered correctly
-    * **400 Bad Request** When there is a failure in the request format or the
-      payload can't be unmarshalled.
-    """
-    try:
-        if request.headers["content-type"] != 'application/json':
+async def service_journey(journey: JourneyIn):
+    """Register a group; 200 when seated at once, 202 when queued."""
+    async with pool_lock:
+        try:
+            car_id = pool.journey(journey.id, journey.people)
+        except CarPoolError:
             return Response(status_code=status.HTTP_400_BAD_REQUEST)
-
-        if journey_request is None:
-            return Response(status_code=status.HTTP_400_BAD_REQUEST)
-
-        if len(journey_request) >= 2:
-            journey_id = journey_request['id']
-            journey_passengers = journey_request['people']
-            allocated_car = car_pooling.journey(journey_id, journey_passengers)
-            if allocated_car == CarPooling.BAD_REQUEST:
-                return Response(status_code=status.HTTP_400_BAD_REQUEST)
-
-            return Response(status_code=status.HTTP_202_ACCEPTED)
-
-        else:
-            return Response(status_code=status.HTTP_400_BAD_REQUEST)
-
-    except Exception:
-        return Response(status_code=status.HTTP_400_BAD_REQUEST)
+    if car_id is None:
+        return Response(status_code=status.HTTP_202_ACCEPTED)
+    return Response(status_code=status.HTTP_200_OK)
 
 
 @app.post("/dropoff")
-async def service_dropoff_request(*, ID: str = Form(...), request: Request):
-    """
-    A group of people requests to be dropped off. Whether they traveled or not.
-
-    **Method** POST
-    **Url** /dropoff
-    **Body** _required_ A form with the group ID, such that `ID=X`
-    **Content Type** `application/x-www-form-urlencoded`
-
-    Returns:
-    * **200 OK** or **204 No Content** When the group is unregistered correctly.
-    * **404 Not Found** When the group is not to be found.
-    * **400 Bad Request** When there is a failure in the request format or the
-      payload can't be unmarshalled.
-    """
-    try:
-        if request.headers["content-type"] != 'application/x-www-form-urlencoded':
-            return Response(status_code=status.HTTP_400_BAD_REQUEST)
-
-        if ID is None:
-            return Response(status_code=status.HTTP_400_BAD_REQUEST)
-
-        journey_id = int(ID)
-        group_id = car_pooling.drop_off(journey_id)
-        if group_id is None:  # drop-off group not found
-            return Response(status_code=status.HTTP_404_NOT_FOUND)
-        else:  # group unregistered correctly
-            return Response(status_code=status.HTTP_204_NO_CONTENT)
-
-    except Exception:
-        return Response(status_code=status.HTTP_400_BAD_REQUEST)
+async def service_dropoff(ID: int = Form(...)):
+    """Unregister a group, whether it traveled or not."""
+    async with pool_lock:
+        found = pool.dropoff(ID)
+    if not found:
+        return Response(status_code=status.HTTP_404_NOT_FOUND)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @app.post("/locate")
-async def service_location_request(*, ID: str = Form(...), request: Request):
-    """
-    Given a group ID such that `ID=X`, return the car the group is traveling
-    with, or no car if they are still waiting to be served (i.e.- journey requested)
-
-    **Method** POST
-    **Url** /location
-    **Body** _required_ A url encoded form with the group ID such that `ID=X`
-    **Content Type** `application/x-www-form-urlencoded`
-    **Accept** `application/json`
-
-    Returns:
-    * **200 OK** With the car as the payload when the group is assigned to a car.
-    * **204 No Content** When the group is waiting to be assigned to a car.
-    * **404 Not Found** When the group is not to be found.
-    * **400 Bad Request** When there is a failure in the request format or the
-      payload can't be unmarshalled.
-    """
-    try:
-        if request.headers["content-type"] != 'application/x-www-form-urlencoded':
-            return Response(status_code=status.HTTP_400_BAD_REQUEST)
-
-        if ID is None:
-            return Response(status_code=status.HTTP_400_BAD_REQUEST)
-
-        journey_id = int(ID)
-        car_id = car_pooling.journey_location.is_allocated(journey_id)
-        if car_id is None:  # car ID not found
+async def service_locate(ID: int = Form(...)):
+    """Return the car a group travels with; 204 while it waits."""
+    async with pool_lock:
+        try:
+            car = pool.locate(ID)
+        except KeyError:
             return Response(status_code=status.HTTP_404_NOT_FOUND)
-        elif car_pooling.journey_request.is_waiting(journey_id):  # car ID waiting
-            return Response(status_code=status.HTTP_204_NO_CONTENT)
-        else:  # car ID located
-            return JSONResponse(content={'car_id': car_id},
-                                status_code=status.HTTP_200_OK)
-
-    except Exception:
-        return Response(status_code=status.HTTP_400_BAD_REQUEST)
+    if car is None:
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+    return {"id": car.id, "seats": car.seats}
 
 
 if __name__ == "__main__":
-    car_pooling = CarPooling()
     uvicorn.run(app, host="0.0.0.0", port=9091, log_level="info")
