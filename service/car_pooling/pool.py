@@ -151,6 +151,8 @@ class CarPool:
 
         if group_id in self._waiting:
             del self._waiting[group_id]
+            # a departing head may have been blocking followers
+            self._process_queue()
         else:
             car = self._cars[self._assignments.pop(group_id)]
             self._unbucket(car)
@@ -182,11 +184,16 @@ class CarPool:
         now = self._clock()
         # timestamps are monotonic and the queue is insertion ordered,
         # so expired entries always form a prefix of the queue
+        expired = False
         for group_id, (_, enqueued_at) in list(self._waiting.items()):
             if now - enqueued_at <= self._queue_ttl:
                 break
             del self._waiting[group_id]
             del self._people[group_id]
+            expired = True
+        if expired:
+            # an expired head may have been blocking followers
+            self._process_queue()
 
     def _priority_active(self) -> bool:
         if self._priority_after is None or not self._waiting:
@@ -213,6 +220,8 @@ class CarPool:
         for group_id, (people, _) in list(self._waiting.items()):
             car = self._find_car(people)
             if car is None:
+                if self._priority_active():
+                    break  # aged head still waits: strict FIFO, nobody passes
                 continue  # still fits nowhere; later groups may ride
             del self._waiting[group_id]
             self._allocate(car, group_id, people)
