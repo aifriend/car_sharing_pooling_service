@@ -1,0 +1,6 @@
+-r service/requirements.txt
+pytest==9.1.1
+# httpx2 kept as-is: provenance is an open review question (see PR body)
+httpx2==2.12.0
+hypothesis==6.165.10
+ruff==0.17.5

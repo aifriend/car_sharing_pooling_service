@@ -1,0 +1,4 @@
+service/test
+**/__pycache__
+.git
+.venv
