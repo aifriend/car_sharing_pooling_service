@@ -106,3 +106,43 @@ def test_priority_disabled_by_default(clock):
     pool.journey(3, 6)                    # waits
     clock.advance(10_000)
     assert pool.journey(4, 2) == 2        # newcomers still ride
+
+
+# ------------------------------------------- queue draining after removals
+
+def test_dropoff_of_aged_waiter_releases_followers(clock):
+    pool = CarPool(priority_after_seconds=10, clock=clock)
+    pool.reset([(1, 4), (2, 6)])
+    pool.journey(1, 4)
+    pool.journey(2, 2)                    # car 2, 4 seats free
+    assert pool.journey(3, 6) is None     # waits, will age
+    clock.advance(11)
+    assert pool.journey(4, 2) is None     # queued behind aged group 3
+    pool.dropoff(3)                       # aged head leaves
+    assert pool.locate(4).id == 2         # follower fits and is seated now
+
+
+def test_ttl_expiry_of_head_releases_followers(clock):
+    pool = CarPool(queue_ttl_seconds=10, priority_after_seconds=5, clock=clock)
+    pool.reset([(1, 4), (2, 6)])
+    pool.journey(1, 4)
+    pool.journey(2, 2)
+    assert pool.journey(3, 6) is None     # enqueued at t=0
+    clock.advance(6)                      # aged, not yet expired
+    assert pool.journey(4, 2) is None     # queued behind group 3
+    clock.advance(5)                      # t=11: group 3 expires, 4 is fresh
+    assert pool.locate(4).id == 2         # purge seats the follower
+    assert pool.groups_waiting == 0
+
+
+def test_aged_head_blocks_later_groups_when_draining(clock):
+    pool = CarPool(priority_after_seconds=10, clock=clock)
+    pool.reset([(1, 6), (2, 2)])
+    pool.journey(1, 6)
+    pool.journey(2, 2)
+    assert pool.journey(3, 5) is None     # waits, will age
+    clock.advance(11)
+    assert pool.journey(4, 1) is None     # strict FIFO: queued
+    pool.dropoff(2)                       # frees 2 seats; group 3 needs 5
+    assert pool.locate(3) is None
+    assert pool.locate(4) is None         # must not jump the aged head
